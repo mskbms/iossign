@@ -1,0 +1,5 @@
+PyQt5==5.15.10
+pycryptodome==3.19.0
+pillow==10.3.0
+pywin32==306
+macholib==1.16.3 

@@ -1,0 +1,308 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os
+import logging
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, 
+    QPushButton, QLabel, QLineEdit, QListWidget, 
+    QListWidgetItem, QFileDialog, QGroupBox, QCheckBox,
+    QMessageBox, QProgressBar, QTextEdit
+)
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, pyqtSlot
+
+from core.dylib_injector import DylibInjector
+
+
+class DylibWorker(QThread):
+    """动态库注入工作线程"""
+    
+    finished = pyqtSignal(bool, str)
+    progress = pyqtSignal(int, str)
+    
+    def __init__(self, injector, ipa_path, dylib_paths, options):
+        super().__init__()
+        self.injector = injector
+        self.ipa_path = ipa_path
+        self.dylib_paths = dylib_paths
+        self.options = options
+    
+    def run(self):
+        """执行注入操作"""
+        self.progress.emit(10, "正在准备注入...")
+        
+        # 执行注入
+        success, result = self.injector.inject_dylib(
+            self.ipa_path,
+            self.dylib_paths,
+            self.options
+        )
+        
+        self.progress.emit(100, "注入完成" if success else "注入失败")
+        self.finished.emit(success, result)
+
+
+class DylibTab(QWidget):
+    """动态库注入标签页"""
+    
+    status_message = pyqtSignal(str)
+    
+    def __init__(self, config):
+        """初始化动态库注入标签页
+        
+        Args:
+            config (dict): 应用配置
+        """
+        super().__init__()
+        
+        self.logger = logging.getLogger("DylibTab")
+        self.config = config
+        
+        # 创建注入器
+        self.injector = DylibInjector(config)
+        
+        # 初始化UI
+        self._init_ui()
+    
+    def _init_ui(self):
+        """初始化用户界面"""
+        # 主布局
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # ======== IPA文件选择 ========
+        ipa_group = QGroupBox("IPA文件")
+        ipa_layout = QHBoxLayout(ipa_group)
+        
+        self.ipa_path_edit = QLineEdit()
+        self.ipa_path_edit.setPlaceholderText("选择IPA文件...")
+        self.ipa_path_edit.setReadOnly(True)
+        
+        self.browse_ipa_btn = QPushButton("浏览...")
+        self.browse_ipa_btn.clicked.connect(self._browse_ipa)
+        
+        ipa_layout.addWidget(self.ipa_path_edit)
+        ipa_layout.addWidget(self.browse_ipa_btn)
+        
+        main_layout.addWidget(ipa_group)
+        
+        # ======== 动态库选择 ========
+        dylib_group = QGroupBox("动态库")
+        dylib_layout = QVBoxLayout(dylib_group)
+        
+        self.dylib_list = QListWidget()
+        self.dylib_list.setMinimumHeight(150)
+        
+        dylib_btn_layout = QHBoxLayout()
+        
+        self.add_dylib_btn = QPushButton("添加动态库")
+        self.add_dylib_btn.clicked.connect(self._add_dylib)
+        
+        self.remove_dylib_btn = QPushButton("移除选中")
+        self.remove_dylib_btn.clicked.connect(self._remove_dylib)
+        
+        self.clear_dylib_btn = QPushButton("清空")
+        self.clear_dylib_btn.clicked.connect(self._clear_dylibs)
+        
+        dylib_btn_layout.addWidget(self.add_dylib_btn)
+        dylib_btn_layout.addWidget(self.remove_dylib_btn)
+        dylib_btn_layout.addWidget(self.clear_dylib_btn)
+        
+        dylib_layout.addWidget(self.dylib_list)
+        dylib_layout.addLayout(dylib_btn_layout)
+        
+        main_layout.addWidget(dylib_group)
+        
+        # ======== 注入选项 ========
+        options_group = QGroupBox("注入选项")
+        options_layout = QFormLayout(options_group)
+        
+        self.weak_link_check = QCheckBox("弱链接")
+        self.weak_link_check.setChecked(False)
+        
+        self.load_path_edit = QLineEdit("@executable_path/Frameworks/")
+        self.load_path_edit.setPlaceholderText("动态库加载路径")
+        
+        options_layout.addRow("链接类型:", self.weak_link_check)
+        options_layout.addRow("加载路径:", self.load_path_edit)
+        
+        main_layout.addWidget(options_group)
+        
+        # ======== 操作按钮 ========
+        button_layout = QHBoxLayout()
+        
+        self.inject_btn = QPushButton("开始注入")
+        self.inject_btn.setMinimumHeight(40)
+        self.inject_btn.clicked.connect(self._start_injection)
+        
+        button_layout.addWidget(self.inject_btn)
+        
+        main_layout.addLayout(button_layout)
+        
+        # ======== 进度条 ========
+        progress_layout = QHBoxLayout()
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        
+        self.progress_label = QLabel("就绪")
+        
+        progress_layout.addWidget(self.progress_bar)
+        progress_layout.addWidget(self.progress_label)
+        
+        main_layout.addLayout(progress_layout)
+        
+        # ======== 日志输出 ========
+        log_group = QGroupBox("日志")
+        log_layout = QVBoxLayout(log_group)
+        
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMinimumHeight(150)
+        
+        log_layout.addWidget(self.log_text)
+        
+        main_layout.addWidget(log_group)
+        
+        # 设置伸缩因子
+        main_layout.setStretch(5, 1)  # 让日志区域占据更多空间
+    
+    def _browse_ipa(self):
+        """浏览选择IPA文件"""
+        file_dialog = QFileDialog(self)
+        file_dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        file_dialog.setNameFilter("IPA文件 (*.ipa)")
+        
+        if file_dialog.exec():
+            selected_files = file_dialog.selectedFiles()
+            if selected_files:
+                self.ipa_path_edit.setText(selected_files[0])
+                self._log(f"选择IPA文件: {selected_files[0]}")
+    
+    def _add_dylib(self):
+        """添加动态库"""
+        file_dialog = QFileDialog(self)
+        file_dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
+        file_dialog.setNameFilter("动态库文件 (*.dylib)")
+        
+        if file_dialog.exec():
+            selected_files = file_dialog.selectedFiles()
+            for file_path in selected_files:
+                item = QListWidgetItem(file_path)
+                item.setData(Qt.ItemDataRole.UserRole, file_path)
+                self.dylib_list.addItem(item)
+                self._log(f"已添加动态库: {file_path}")
+    
+    def _remove_dylib(self):
+        """移除选中的动态库"""
+        selected_items = self.dylib_list.selectedItems()
+        for item in selected_items:
+            row = self.dylib_list.row(item)
+            removed_item = self.dylib_list.takeItem(row)
+            self._log(f"已移除动态库: {removed_item.text()}")
+    
+    def _clear_dylibs(self):
+        """清空动态库列表"""
+        self.dylib_list.clear()
+        self._log("已清空动态库列表")
+    
+    def _start_injection(self):
+        """开始注入操作"""
+        # 检查输入
+        ipa_path = self.ipa_path_edit.text()
+        if not ipa_path:
+            QMessageBox.warning(self, "警告", "请选择IPA文件")
+            return
+        
+        if self.dylib_list.count() == 0:
+            QMessageBox.warning(self, "警告", "请添加至少一个动态库")
+            return
+        
+        # 获取所有动态库路径
+        dylib_paths = []
+        for i in range(self.dylib_list.count()):
+            item = self.dylib_list.item(i)
+            dylib_paths.append(item.data(Qt.ItemDataRole.UserRole))
+        
+        # 构建注入选项
+        options = {
+            "weak": self.weak_link_check.isChecked(),
+            "load_path": self.load_path_edit.text()
+        }
+        
+        # 清空日志
+        self.log_text.clear()
+        
+        # 禁用按钮
+        self.inject_btn.setEnabled(False)
+        
+        # 创建并启动工作线程
+        self.dylib_worker = DylibWorker(
+            self.injector,
+            ipa_path,
+            dylib_paths,
+            options
+        )
+        
+        self.dylib_worker.progress.connect(self._update_progress)
+        self.dylib_worker.finished.connect(self._on_injection_finished)
+        
+        self._log("开始注入操作...")
+        self.dylib_worker.start()
+    
+    @pyqtSlot(int, str)
+    def _update_progress(self, value, message):
+        """更新进度条
+        
+        Args:
+            value (int): 进度值(0-100)
+            message (str): 进度消息
+        """
+        self.progress_bar.setValue(value)
+        self.progress_label.setText(message)
+        self.status_message.emit(message)
+        self._log(message)
+    
+    @pyqtSlot(bool, str)
+    def _on_injection_finished(self, success, result):
+        """注入完成回调
+        
+        Args:
+            success (bool): 是否成功
+            result (str): 结果消息或输出路径
+        """
+        # 启用按钮
+        self.inject_btn.setEnabled(True)
+        
+        if success:
+            self._log(f"注入成功，输出文件: {result}")
+            QMessageBox.information(
+                self,
+                "注入成功",
+                f"动态库注入成功!\n\n输出文件: {result}"
+            )
+        else:
+            self._log(f"注入失败: {result}")
+            QMessageBox.critical(
+                self,
+                "注入失败",
+                f"动态库注入失败!\n\n错误: {result}"
+            )
+    
+    def _log(self, message):
+        """添加日志消息
+        
+        Args:
+            message (str): 日志消息
+        """
+        self.log_text.append(message)
+    
+    def update_config(self, config):
+        """更新配置
+        
+        Args:
+            config (dict): 新的配置
+        """
+        self.config = config
+        self.injector = DylibInjector(config) 

@@ -1,0 +1,376 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+动态库注入选项卡模块
+"""
+
+import os
+import logging
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QListWidget, QListWidgetItem, QFileDialog, QMessageBox, QGroupBox,
+    QFormLayout, QComboBox, QCheckBox
+)
+from PyQt5.QtCore import Qt
+
+from ...utils.process_utils import run_optool, is_tool_available
+from ...utils.file_utils import extract_ipa, get_app_path_in_ipa, read_plist
+
+logger = logging.getLogger(__name__)
+
+class InjectTab(QWidget):
+    """动态库注入选项卡类"""
+    
+    def __init__(self):
+        """初始化动态库注入选项卡"""
+        super().__init__()
+        
+        self.ipa_path = ""
+        self.dylibs = []
+        self.app_path = ""
+        self.executable_path = ""
+        
+        # 初始化UI
+        self._init_ui()
+        
+        # 检查工具可用性
+        self._check_tool_availability()
+    
+    def _init_ui(self):
+        """初始化UI"""
+        # 主布局
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # IPA文件选择
+        ipa_group = QGroupBox("IPA文件")
+        ipa_layout = QHBoxLayout(ipa_group)
+        
+        self.ipa_path_edit = QLineEdit()
+        self.ipa_path_edit.setReadOnly(True)
+        self.ipa_path_edit.setPlaceholderText("请选择IPA文件...")
+        
+        browse_button = QPushButton("浏览...")
+        browse_button.clicked.connect(self._browse_ipa)
+        
+        ipa_layout.addWidget(self.ipa_path_edit)
+        ipa_layout.addWidget(browse_button)
+        
+        main_layout.addWidget(ipa_group)
+        
+        # 应用信息
+        info_group = QGroupBox("应用信息")
+        info_layout = QFormLayout(info_group)
+        
+        self.bundle_id_label = QLabel("")
+        info_layout.addRow("Bundle ID:", self.bundle_id_label)
+        
+        self.app_name_label = QLabel("")
+        info_layout.addRow("应用名称:", self.app_name_label)
+        
+        self.executable_label = QLabel("")
+        info_layout.addRow("可执行文件:", self.executable_label)
+        
+        main_layout.addWidget(info_group)
+        
+        # 动态库列表
+        dylib_group = QGroupBox("动态库")
+        dylib_layout = QVBoxLayout(dylib_group)
+        
+        self.dylib_list = QListWidget()
+        self.dylib_list.setSelectionMode(QListWidget.SingleSelection)
+        
+        dylib_layout.addWidget(self.dylib_list)
+        
+        # 动态库操作按钮
+        dylib_buttons_layout = QHBoxLayout()
+        
+        add_dylib_button = QPushButton("添加动态库")
+        add_dylib_button.clicked.connect(self._add_dylib)
+        
+        remove_dylib_button = QPushButton("移除动态库")
+        remove_dylib_button.clicked.connect(self._remove_dylib)
+        
+        clear_dylib_button = QPushButton("清空列表")
+        clear_dylib_button.clicked.connect(self._clear_dylibs)
+        
+        dylib_buttons_layout.addWidget(add_dylib_button)
+        dylib_buttons_layout.addWidget(remove_dylib_button)
+        dylib_buttons_layout.addWidget(clear_dylib_button)
+        
+        dylib_layout.addLayout(dylib_buttons_layout)
+        
+        main_layout.addWidget(dylib_group)
+        
+        # 注入选项
+        options_group = QGroupBox("注入选项")
+        options_layout = QVBoxLayout(options_group)
+        
+        self.weak_inject_check = QCheckBox("弱注入 (weak)")
+        self.weak_inject_check.setToolTip("使用弱链接方式注入，如果动态库不存在，应用仍然可以运行")
+        
+        options_layout.addWidget(self.weak_inject_check)
+        
+        main_layout.addWidget(options_group)
+        
+        # 操作按钮
+        buttons_layout = QHBoxLayout()
+        
+        self.inject_button = QPushButton("执行注入")
+        self.inject_button.setMinimumWidth(120)
+        self.inject_button.clicked.connect(self._inject_dylibs)
+        self.inject_button.setEnabled(False)
+        
+        buttons_layout.addStretch()
+        buttons_layout.addWidget(self.inject_button)
+        
+        main_layout.addLayout(buttons_layout)
+        
+        # 状态标签
+        self.status_label = QLabel("就绪")
+        main_layout.addWidget(self.status_label)
+        
+        # 添加伸缩项
+        main_layout.addStretch()
+    
+    def _check_tool_availability(self):
+        """检查工具可用性"""
+        if not is_tool_available("optool"):
+            message = "optool工具不可用，动态库注入功能将无法使用"
+            self.status_label.setText(f"警告: {message}")
+            
+            # 创建一个信息标签，显示在UI顶部
+            info_label = QLabel(
+                "提示：要使用动态库注入功能，请下载optool工具并放入tools/optool目录。\n"
+                "optool是一个用于iOS应用的动态库注入工具，可以从GitHub获取：\n"
+                "https://github.com/alexzielenski/optool/releases"
+            )
+            info_label.setStyleSheet("color: #FF6600; background-color: #FFFFCC; padding: 10px; border-radius: 5px;")
+            info_label.setWordWrap(True)
+            
+            # 将信息标签添加到布局的顶部
+            # 检查是否已经添加过信息标签
+            layout = self.layout()
+            if layout.count() > 0 and isinstance(layout.itemAt(0).widget(), QLabel):
+                # 已经有信息标签，不需要再添加
+                pass
+            else:
+                layout.insertWidget(0, info_label)
+            
+            # 禁用所有操作按钮
+            self.inject_button.setEnabled(False)
+    
+    def _browse_ipa(self):
+        """浏览IPA文件"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择IPA文件", "", "IPA文件 (*.ipa);;所有文件 (*.*)"
+        )
+        
+        if file_path:
+            self.set_ipa_path(file_path)
+    
+    def set_ipa_path(self, file_path):
+        """
+        设置IPA文件路径
+        
+        Args:
+            file_path: IPA文件路径
+        """
+        self.ipa_path = file_path
+        self.ipa_path_edit.setText(file_path)
+        
+        # 重置状态
+        self.app_path = ""
+        self.executable_path = ""
+        self.bundle_id_label.setText("")
+        self.app_name_label.setText("")
+        self.executable_label.setText("")
+        self.inject_button.setEnabled(False)
+        
+        # 解析IPA文件
+        self._parse_ipa()
+    
+    def _parse_ipa(self):
+        """解析IPA文件"""
+        if not self.ipa_path or not os.path.exists(self.ipa_path):
+            return
+        
+        self.status_label.setText("正在解析IPA文件...")
+        
+        # 解压IPA文件
+        extract_dir, original_app_name = extract_ipa(self.ipa_path)
+        if not extract_dir:
+            self.status_label.setText("解压IPA文件失败")
+            return
+        
+        # 获取.app路径
+        app_path = get_app_path_in_ipa(extract_dir)
+        if not app_path:
+            self.status_label.setText("找不到.app目录")
+            return
+        
+        self.app_path = app_path
+        
+        # 读取Info.plist
+        info_plist_path = os.path.join(app_path, "Info.plist")
+        if not os.path.exists(info_plist_path):
+            self.status_label.setText("找不到Info.plist文件")
+            return
+        
+        info_plist = read_plist(info_plist_path)
+        if not info_plist:
+            self.status_label.setText("读取Info.plist失败")
+            return
+        
+        # 获取应用信息
+        bundle_id = info_plist.get("CFBundleIdentifier", "")
+        app_name = info_plist.get("CFBundleDisplayName", "") or info_plist.get("CFBundleName", "")
+        executable_name = info_plist.get("CFBundleExecutable", "")
+        
+        self.bundle_id_label.setText(bundle_id)
+        self.app_name_label.setText(app_name)
+        self.executable_label.setText(executable_name)
+        
+        # 获取可执行文件路径
+        if executable_name:
+            executable_path = os.path.join(app_path, executable_name)
+            if os.path.exists(executable_path):
+                self.executable_path = executable_path
+                
+                # 只有在optool可用时才启用注入按钮
+                if is_tool_available("optool"):
+                    self.inject_button.setEnabled(True)
+                    self.status_label.setText("IPA文件解析成功，可以进行动态库注入")
+                else:
+                    self.status_label.setText("IPA文件解析成功，但optool工具不可用，无法进行注入")
+            else:
+                self.status_label.setText(f"找不到可执行文件: {executable_name}")
+        else:
+            self.status_label.setText("无法获取可执行文件名称")
+    
+    def _add_dylib(self):
+        """添加动态库"""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择动态库", "", "动态库 (*.dylib);;所有文件 (*.*)"
+        )
+        
+        if not file_paths:
+            return
+        
+        for file_path in file_paths:
+            # 检查是否已存在
+            exists = False
+            for i in range(self.dylib_list.count()):
+                if self.dylib_list.item(i).data(Qt.UserRole) == file_path:
+                    exists = True
+                    break
+            
+            if not exists:
+                item = QListWidgetItem(os.path.basename(file_path))
+                item.setData(Qt.UserRole, file_path)
+                self.dylib_list.addItem(item)
+                self.dylibs.append(file_path)
+    
+    def _remove_dylib(self):
+        """移除动态库"""
+        current_item = self.dylib_list.currentItem()
+        if current_item:
+            file_path = current_item.data(Qt.UserRole)
+            row = self.dylib_list.row(current_item)
+            self.dylib_list.takeItem(row)
+            
+            if file_path in self.dylibs:
+                self.dylibs.remove(file_path)
+    
+    def _clear_dylibs(self):
+        """清空动态库列表"""
+        self.dylib_list.clear()
+        self.dylibs = []
+    
+    def _inject_dylibs(self):
+        """执行动态库注入"""
+        # 检查是否有动态库
+        if not self.dylibs:
+            QMessageBox.warning(self, "错误", "请先添加要注入的动态库")
+            return
+        
+        # 检查工具可用性
+        if not is_tool_available("optool"):
+            QMessageBox.critical(self, "错误", "optool工具不可用，无法执行注入")
+            return
+        
+        # 检查IPA和可执行文件
+        if not self.app_path or not self.executable_path:
+            QMessageBox.warning(self, "错误", "请先选择有效的IPA文件")
+            return
+        
+        # 确认注入
+        reply = QMessageBox.question(
+            self,
+            "确认注入",
+            f"确定要向 {os.path.basename(self.executable_path)} 注入 {len(self.dylibs)} 个动态库吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        # 执行注入
+        success_count = 0
+        fail_count = 0
+        
+        for dylib_path in self.dylibs:
+            # 复制动态库到应用目录
+            dylib_name = os.path.basename(dylib_path)
+            target_dylib_path = os.path.join(self.app_path, dylib_name)
+            
+            try:
+                with open(dylib_path, 'rb') as src_file, open(target_dylib_path, 'wb') as dest_file:
+                    dest_file.write(src_file.read())
+            except Exception as e:
+                logger.error(f"复制动态库失败: {e}")
+                fail_count += 1
+                continue
+            
+            # 构建optool命令参数
+            args = [
+                "install",
+                "-c", "load",
+                "-p", f"@executable_path/{dylib_name}",
+                "-t", self.executable_path
+            ]
+            
+            # 添加弱注入参数
+            if self.weak_inject_check.isChecked():
+                args.extend(["-w"])
+            
+            # 执行命令
+            self.status_label.setText(f"正在注入: {dylib_name}")
+            code, stdout, stderr = run_optool(args)
+            
+            if code != 0:
+                logger.error(f"注入动态库失败: {stderr}")
+                fail_count += 1
+            else:
+                logger.info(f"注入动态库成功: {dylib_name}")
+                success_count += 1
+        
+        # 显示结果
+        if fail_count == 0:
+            self.status_label.setText(f"所有动态库注入成功 ({success_count}个)")
+            QMessageBox.information(
+                self,
+                "注入成功",
+                f"已成功注入 {success_count} 个动态库。\n\n"
+                "请使用签名选项卡对修改后的应用进行重新签名。"
+            )
+        else:
+            self.status_label.setText(f"部分动态库注入失败 (成功: {success_count}, 失败: {fail_count})")
+            QMessageBox.warning(
+                self,
+                "注入部分成功",
+                f"成功注入 {success_count} 个动态库，失败 {fail_count} 个。\n\n"
+                "请查看日志获取详细信息。"
+            ) 

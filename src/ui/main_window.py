@@ -1,0 +1,306 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+主窗口模块
+"""
+
+import os
+import sys
+import logging
+import traceback
+from pathlib import Path
+from PyQt5.QtWidgets import (
+    QMainWindow, QTabWidget, QAction, QMenu, QMessageBox,
+    QFileDialog, QStatusBar, QToolBar, QWidget, QVBoxLayout,
+    QApplication
+)
+from PyQt5.QtCore import Qt, QSize, QTimer
+from PyQt5.QtGui import QIcon, QClipboard
+
+from ..core.certificate_manager import CertificateManager
+from ..core.sign_engine import SignEngine
+from ..utils.config_utils import get_config_value, set_config_value, get_recent_files
+from .tabs.sign_tab import SignTab
+from .tabs.certificate_tab import CertificateTab
+from .tabs.time_lock_tab import TimeLockTab
+from .tabs.settings_tab import SettingsTab
+
+logger = logging.getLogger(__name__)
+
+class MainWindow(QMainWindow):
+    """主窗口类"""
+    
+    def __init__(self):
+        """初始化主窗口"""
+        super().__init__()
+        
+        # 初始化模型
+        self.certificate_manager = CertificateManager()
+        self.sign_engine = SignEngine(self.certificate_manager)
+        
+        # 设置窗口属性
+        self.setWindowTitle("千寻专用iOS签名工具 QQ 24587587")
+        self.setMinimumSize(830, 1050)
+        
+        # 设置应用图标
+        icon_path = self._get_app_icon_path()
+        if icon_path:
+            self.setWindowIcon(QIcon(icon_path))
+        
+        # 初始化UI
+        self._init_ui()
+        
+        # 加载最近文件
+        self._load_recent_files()
+        
+        logger.info("主窗口初始化完成")
+    
+    def _init_ui(self):
+        """初始化UI"""
+        # 创建中心部件
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # 创建布局
+        layout = QVBoxLayout(central_widget)
+        layout.setContentsMargins(5, 5, 5, 5)
+        
+        # 创建选项卡
+        self.tab_widget = QTabWidget()
+        layout.addWidget(self.tab_widget)
+        
+        # 添加选项卡
+        self.sign_tab = SignTab(self.certificate_manager, self.sign_engine)
+        self.certificate_tab = CertificateTab(self.certificate_manager)
+        self.time_lock_tab = TimeLockTab()
+        self.settings_tab = SettingsTab()
+        
+        self.tab_widget.addTab(self.sign_tab, "单个签名")
+        self.tab_widget.addTab(self.certificate_tab, "证书管理")
+        self.tab_widget.addTab(self.time_lock_tab, "时间限制")
+        self.tab_widget.addTab(self.settings_tab, "设置")
+        
+        # 创建菜单栏
+        self._create_menu_bar()
+        
+        # 创建状态栏
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage("就绪")
+    
+    def _create_menu_bar(self):
+        """创建菜单栏"""
+        menu_bar = self.menuBar()
+        
+        # 文件菜单
+        file_menu = menu_bar.addMenu("文件")
+        
+        # 打开IPA
+        open_action = QAction(QIcon(self._get_icon_path("open.png")), "打开IPA", self)
+     #   open_action.setShortcut("Ctrl+O")
+        open_action.triggered.connect(self._open_ipa)
+        file_menu.addAction(open_action)
+        
+        # 最近文件
+        self.recent_menu = QMenu("最近文件", self)
+        file_menu.addMenu(self.recent_menu)
+        
+        # 分隔线
+        file_menu.addSeparator()
+        
+        # 退出
+        exit_action = QAction("退出", self)
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+        
+        # 工具菜单
+        tools_menu = menu_bar.addMenu("工具")
+        
+        # 验证IPA
+        verify_action = QAction("验证IPA签名", self)
+        verify_action.triggered.connect(self._verify_ipa)
+        tools_menu.addAction(verify_action)
+        
+        # 提取IPA信息
+        extract_info_action = QAction("提取IPA信息", self)
+        extract_info_action.triggered.connect(self._extract_ipa_info)
+        tools_menu.addAction(extract_info_action)
+        
+        # 帮助菜单
+        help_menu = menu_bar.addMenu("帮助")
+        
+        # 关于
+        about_action = QAction("关于", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
+        
+        # 检查更新
+        check_update_action = QAction("检查更新", self)
+        check_update_action.triggered.connect(self._check_update)
+        help_menu.addAction(check_update_action)
+    
+    def _get_icon_path(self, icon_name):
+        """
+        获取图标路径
+        
+        Args:
+            icon_name: 图标文件名
+        
+        Returns:
+            str: 图标路径
+        """
+        base_dir = Path(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        icon_path = base_dir / "resources" / "icons" / icon_name
+        
+        if icon_path.exists():
+            return str(icon_path)
+        else:
+            return ""
+    
+    def _get_app_icon_path(self):
+        """
+        获取应用图标路径
+        
+        Returns:
+            str: 应用图标路径
+        """
+        base_dir = Path(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        icon_path = base_dir / "resources" / "icon.ico"
+        
+        if icon_path.exists():
+            return str(icon_path)
+        else:
+            return ""
+    
+    def _load_recent_files(self):
+        """加载最近文件列表"""
+        recent_files = get_recent_files()
+        self.recent_menu.clear()
+        
+        if not recent_files:
+            no_recent_action = QAction("无最近文件", self)
+            no_recent_action.setEnabled(False)
+            self.recent_menu.addAction(no_recent_action)
+            return
+        
+        for file_path in recent_files:
+            action = QAction(os.path.basename(file_path), self)
+            action.setData(file_path)
+            action.triggered.connect(lambda checked, path=file_path: self._open_recent_file(path))
+            self.recent_menu.addAction(action)
+        
+        # 添加清除菜单项
+        self.recent_menu.addSeparator()
+        clear_action = QAction("清除最近文件", self)
+        clear_action.triggered.connect(self._clear_recent_files)
+        self.recent_menu.addAction(clear_action)
+    
+    def _open_ipa(self):
+        """打开IPA文件"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "打开IPA文件", "", "IPA文件 (*.ipa);;所有文件 (*.*)"
+        )
+        
+        if file_path:
+            self._process_ipa_file(file_path)
+    
+    def _open_recent_file(self, file_path):
+        """打开最近文件"""
+        if os.path.exists(file_path):
+            self._process_ipa_file(file_path)
+        else:
+            QMessageBox.warning(self, "文件不存在", f"文件不存在: {file_path}")
+            # 从最近文件列表中移除
+            recent_files = get_recent_files()
+            if file_path in recent_files:
+                recent_files.remove(file_path)
+                set_config_value("recent_files", recent_files)
+                self._load_recent_files()
+    
+    def _process_ipa_file(self, file_path):
+        """处理IPA文件"""
+        # 更新UI
+        self.status_bar.showMessage(f"已加载: {file_path}")
+        
+        # 切换到签名选项卡
+        self.tab_widget.setCurrentWidget(self.sign_tab)
+        
+        # 设置文件路径
+        self.sign_tab.set_ipa_path(file_path)
+        
+        # 添加到最近文件
+        from ..utils.config_utils import add_recent_file
+        add_recent_file(file_path)
+        self._load_recent_files()
+    
+    def _clear_recent_files(self):
+        """清除最近文件列表"""
+        set_config_value("recent_files", [])
+        self._load_recent_files()
+    
+    def _verify_ipa(self):
+        """验证IPA签名"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择IPA文件", "", "IPA文件 (*.ipa);;所有文件 (*.*)"
+        )
+        
+        if not file_path:
+            return
+        
+        # TODO: 实现IPA签名验证
+        QMessageBox.information(self, "验证IPA签名", "此功能尚未实现")
+    
+    def _extract_ipa_info(self):
+        """提取IPA信息"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择IPA文件", "", "IPA文件 (*.ipa);;所有文件 (*.*)"
+        )
+        
+        if not file_path:
+            return
+        
+        # TODO: 实现IPA信息提取
+        QMessageBox.information(self, "提取IPA信息", "此功能尚未实现")
+    
+    def _show_about(self):
+        """显示关于对话框"""
+        QMessageBox.about(
+            self,
+            "关于千寻专用iOS签名工具",
+            "千寻专用iOS签名工具 v1.0.0\n\n"
+            "一个用于iOS应用签名的工具，支持证书管理、动态库注入和时间限制等功能。\n\n"
+            "© 2023 千寻专用iOS签名工具 QQ 24587587"
+        )
+    
+    def _check_update(self):
+        """检查更新"""
+        # TODO: 实现检查更新功能
+        QMessageBox.information(self, "检查更新", "当前已是最新版本")
+    
+    def closeEvent(self, event):
+        """关闭窗口事件"""
+        reply = QMessageBox.question(
+            self, "确认退出", "确定要退出程序吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            event.accept()
+        else:
+            event.ignore()
+
+    def _copy_to_clipboard(self, text):
+        """
+        安全地复制文本到剪贴板
+        
+        Args:
+            text: 要复制的文本
+        """
+        try:
+            clipboard = QApplication.clipboard()
+            clipboard.setText(text)
+        except Exception as e:
+            logger.warning(f"复制到剪贴板失败: {e}")
+            # 不显示错误消息，静默失败 

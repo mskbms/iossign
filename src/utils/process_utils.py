@@ -1,0 +1,152 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+进程操作工具函数
+"""
+
+import os
+import sys
+import subprocess
+import logging
+import platform
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+def _mask_sensitive_cmd(cmd):
+    """
+    对命令中的敏感参数进行脱敏，避免日志泄露密码。
+    """
+    if not isinstance(cmd, list):
+        return cmd
+
+    masked = cmd.copy()
+    for i, arg in enumerate(masked):
+        if arg in ("-p", "--password") and i + 1 < len(masked):
+            masked[i + 1] = "******"
+    return masked
+
+def get_tool_path(tool_name):
+    """
+    获取工具路径
+    
+    Args:
+        tool_name: 工具名称 (zsign)
+    
+    Returns:
+        str: 工具路径
+    """
+    base_dir = Path(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    tools_dir = base_dir / "tools"
+    
+    if tool_name == "zsign":
+        tool_dir = tools_dir / "zsign"
+        if platform.system() == "Windows":
+            return str(tool_dir / "zsign.exe")
+        else:
+            return str(tool_dir / "zsign")
+
+    else:
+        logger.error(f"未知工具: {tool_name}")
+        return None
+
+def run_command(cmd, cwd=None, timeout=None):
+    """
+    运行命令
+    
+    Args:
+        cmd: 命令列表或字符串
+        cwd: 工作目录
+        timeout: 超时时间(秒)
+    
+    Returns:
+        tuple: (返回码, 标准输出, 标准错误)
+    """
+    try:
+        logger.debug(f"运行命令: {_mask_sensitive_cmd(cmd)}")
+        
+        # 处理命令参数
+        if isinstance(cmd, str):
+            shell = True
+        else:
+            shell = False
+        
+        # 在Windows系统下，设置startupinfo以隐藏命令窗口
+        startupinfo = None
+        if platform.system() == "Windows":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+        
+        # 运行命令
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=shell,
+            cwd=cwd,
+            universal_newlines=True,
+            startupinfo=startupinfo
+        )
+        
+        # 等待命令完成
+        stdout, stderr = process.communicate(timeout=timeout)
+        return_code = process.returncode
+        
+        # 记录命令输出
+        if stdout:
+            logger.debug(f"命令标准输出: {stdout}")
+        if stderr:
+            logger.debug(f"命令标准错误: {stderr}")
+        
+        return return_code, stdout, stderr
+    except subprocess.TimeoutExpired:
+        process.kill()
+        logger.error(f"命令执行超时: {cmd}")
+        return -1, "", "命令执行超时"
+    except Exception as e:
+        logger.error(f"命令执行失败: {e}")
+        return -1, "", str(e)
+
+def run_zsign(args):
+    """
+    运行zsign命令
+    
+    Args:
+        args: zsign参数列表
+    
+    Returns:
+        tuple: (返回码, 标准输出, 标准错误)
+    """
+    zsign_path = get_tool_path("zsign")
+    if not zsign_path or not os.path.exists(zsign_path):
+        logger.error("zsign工具不存在")
+        return -1, "", "zsign工具不存在"
+    
+    cmd = [zsign_path] + args
+    return run_command(cmd)
+
+
+
+def is_tool_available(tool_name):
+    """
+    检查工具是否可用
+    
+    Args:
+        tool_name: 工具名称 (zsign)
+    
+    Returns:
+        bool: 工具是否可用
+    """
+    tool_path = get_tool_path(tool_name)
+    if not tool_path or not os.path.exists(tool_path):
+        logger.info(f"{tool_name}工具不存在")
+        return False
+    
+    # 尝试运行工具
+    if tool_name == "zsign":
+        code, _, _ = run_zsign(["-v"])
+        return code == 0
+    
+    return False 

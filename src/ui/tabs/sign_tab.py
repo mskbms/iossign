@@ -1,0 +1,1089 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+签名选项卡模块
+"""
+
+import os
+import logging
+import shutil
+import zipfile
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QComboBox, QCheckBox, QGroupBox, QFileDialog, QMessageBox,
+    QProgressBar, QSpinBox, QFormLayout, QGridLayout, QListWidget, QListWidgetItem
+)
+from PyQt5.QtCore import Qt, pyqtSignal, QUrl, QThread, pyqtSlot
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent
+
+from ...core.certificate_manager import CertificateManager
+from ...core.sign_engine import SignEngine
+from ...utils.file_utils import extract_ipa, get_app_path_in_ipa, read_plist, get_app_dylibs
+
+logger = logging.getLogger(__name__)
+
+# 解析IPA线程
+class ParseIpaThread(QThread):
+    # 定义信号
+    finished = pyqtSignal(dict)  # 成功完成解析
+    error = pyqtSignal(str)      # 解析出错
+    progress = pyqtSignal(str)   # 进度更新
+    
+    def __init__(self, ipa_path):
+        super().__init__()
+        self.ipa_path = ipa_path
+        self.extract_dir = None
+        self.app_path = None
+    
+    def run(self):
+        try:
+            self.progress.emit("正在解析IPA文件...")
+            self.extract_dir, self.original_app_name = extract_ipa(self.ipa_path)
+            if not self.extract_dir:
+                self.error.emit("解压IPA文件失败")
+                return
+            self.app_path = get_app_path_in_ipa(self.extract_dir)
+            if not self.app_path:
+                self.error.emit("找不到.app目录")
+                return
+            info_plist_path = os.path.join(self.app_path, "Info.plist")
+            if not os.path.exists(info_plist_path):
+                self.error.emit("找不到Info.plist文件")
+                return
+            info_plist = read_plist(info_plist_path)
+            if not info_plist:
+                self.error.emit("读取Info.plist失败")
+                return
+            bundle_id = info_plist.get("CFBundleIdentifier", "")
+            bundle_name = info_plist.get("CFBundleName", "")
+            display_name = info_plist.get("CFBundleDisplayName", "")
+            version = info_plist.get("CFBundleShortVersionString", "")
+            build = info_plist.get("CFBundleVersion", "")
+            dylibs = get_app_dylibs(self.app_path)
+            app_info = {
+                "bundle_id": bundle_id,
+                "bundle_name": bundle_name,
+                "display_name": display_name,
+                "version": version,
+                "build": build,
+                "extract_dir": self.extract_dir,
+                "app_path": self.app_path,
+                "dylibs": dylibs,
+                "original_app_name": self.original_app_name
+            }
+            self.progress.emit("IPA文件解析成功")
+            self.finished.emit(app_info)
+        except Exception as e:
+            logger.exception("解析IPA文件出错")
+            self.error.emit(f"解析IPA文件出错: {str(e)}")
+
+# 签名线程
+class SignIpaThread(QThread):
+    # 定义信号
+    finished = pyqtSignal(str)   # 签名成功，返回输出路径
+    error = pyqtSignal(str)      # 签名失败
+    progress = pyqtSignal(int, str)  # 进度更新
+    
+    def __init__(self, sign_engine, ipa_path, cert_id, output_path, 
+                 bundle_id=None, bundle_name=None, bundle_version=None, 
+                 inject_dylibs=None, original_app_name=None, display_name=None, version_code=None, version_name=None, inject_frameworks=None,
+                 extract_dir=None, app_path=None):
+        super().__init__()
+        self.sign_engine = sign_engine
+        self.ipa_path = ipa_path
+        self.cert_id = cert_id
+        self.output_path = output_path
+        self.bundle_id = bundle_id
+        self.bundle_name = bundle_name
+        self.bundle_version = bundle_version
+        self.inject_dylibs = inject_dylibs
+        self.original_app_name = original_app_name
+        self.display_name = display_name
+        self.version_code = version_code
+        self.version_name = version_name
+        self.inject_frameworks = inject_frameworks or []
+        self.extract_dir = extract_dir
+        self.app_path = app_path
+    
+    def run(self):
+        try:
+            # 设置进度回调
+            self.sign_engine.set_progress_callback(self._update_progress)
+            
+            # 执行签名
+            output_path = self.sign_engine.sign_ipa(
+                self.ipa_path,
+                self.cert_id,
+                output_path=self.output_path,
+                bundle_id=self.bundle_id,
+                bundle_name=self.bundle_name,
+                bundle_version=self.bundle_version,
+                inject_dylibs=self.inject_dylibs,
+                time_limit=None,
+                original_app_name=self.original_app_name,
+                display_name=self.display_name,
+                version_code=self.version_code,
+                version_name=self.version_name,
+                inject_frameworks=self.inject_frameworks,
+                extract_dir=self.extract_dir,
+                app_path=self.app_path
+            )
+            
+            if output_path:
+                self.progress.emit(100, "签名完成")
+                self.finished.emit(output_path)
+            else:
+                self.error.emit("签名失败，请检查日志获取详细信息")
+                
+        except Exception as e:
+            logger.exception("签名过程出错")
+            self.error.emit(f"签名过程出错: {str(e)}")
+    
+    def _update_progress(self, progress, message):
+        self.progress.emit(progress, message)
+
+class SignTab(QWidget):
+    """签名选项卡类"""
+    
+    def __init__(self, certificate_manager, sign_engine):
+        """
+        初始化签名选项卡
+        
+        Args:
+            certificate_manager: 证书管理器
+            sign_engine: 签名引擎
+        """
+        super().__init__()
+        
+        self.certificate_manager = certificate_manager
+        self.sign_engine = sign_engine
+        self.ipa_path = ""
+        self.dylibs = []
+        self.inject_dylibs = []  # 待注入的动态库列表
+        self.inject_frameworks = []  # 待注入的framework列表
+        self.extract_dir = None
+        self.app_path = None
+        self.app_info = {}
+        
+        # 线程对象
+        self.parse_thread = None
+        self.sign_thread = None
+        
+        # 启用拖放
+        self.setAcceptDrops(True)
+        
+        # 初始化UI
+        self._init_ui()
+        
+        # 更新证书列表
+        self._update_certificate_list()
+    
+    def _init_ui(self):
+        """初始化UI"""
+        # 主布局
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # IPA文件选择
+        ipa_group = QGroupBox("IPA文件")
+        ipa_layout = QHBoxLayout(ipa_group)
+        
+        self.ipa_path_edit = QLineEdit()
+        self.ipa_path_edit.setReadOnly(True)
+        self.ipa_path_edit.setPlaceholderText("请选择IPA文件或拖拽文件到此处...")
+        
+        browse_button = QPushButton("浏览...")
+        browse_button.clicked.connect(self._browse_ipa)
+        
+        ipa_layout.addWidget(self.ipa_path_edit)
+        ipa_layout.addWidget(browse_button)
+        
+        main_layout.addWidget(ipa_group)
+        
+        # 证书选择
+        cert_group = QGroupBox("证书")
+        cert_layout = QFormLayout(cert_group)
+        
+        self.cert_combo = QComboBox()
+        self.cert_combo.setMinimumWidth(300)
+        cert_layout.addRow("选择证书:", self.cert_combo)
+        
+        main_layout.addWidget(cert_group)
+        
+        # 签名选项
+        options_group = QGroupBox("签名选项")
+        options_layout = QFormLayout(options_group)
+        
+        # Bundle ID
+        self.bundle_id_edit = QLineEdit()
+        self.bundle_id_edit.setPlaceholderText("保持原始Bundle ID")
+        options_layout.addRow("Bundle ID:", self.bundle_id_edit)
+        
+        # 应用名称(中文) + 应用名称(英文) 一排
+        app_name_layout = QHBoxLayout()
+        self.app_name_cn_edit = QLineEdit()
+        self.app_name_cn_edit.setPlaceholderText("保持原始中文名称")
+        self.app_name_en_edit = QLineEdit()
+        self.app_name_en_edit.setPlaceholderText("保持原始英文名称")
+        app_name_layout.addWidget(QLabel("应用名称(中文):"))
+        app_name_layout.addWidget(self.app_name_cn_edit)
+        app_name_layout.addWidget(QLabel("应用名称(英文):"))
+        app_name_layout.addWidget(self.app_name_en_edit)
+        options_layout.addRow(app_name_layout)
+        
+        # 版本编号 + 版本名称 一排
+        version_layout = QHBoxLayout()
+        self.version_code_edit = QLineEdit()
+        self.version_code_edit.setPlaceholderText("保持原始版本编号")
+        self.version_name_edit = QLineEdit()
+        self.version_name_edit.setPlaceholderText("保持原始版本名称")
+        version_layout.addWidget(QLabel("版本编号:"))
+        version_layout.addWidget(self.version_code_edit)
+        version_layout.addWidget(QLabel("版本名称:"))
+        version_layout.addWidget(self.version_name_edit)
+        options_layout.addRow(version_layout)
+        
+        main_layout.addWidget(options_group)
+        
+        # 动态库管理
+        dylibs_group = QGroupBox("动态库管理")
+        dylibs_layout = QVBoxLayout(dylibs_group)
+        
+        # 创建水平分割的两个区域：左侧应用动态库，右侧待注入动态库
+        dylib_split_layout = QHBoxLayout()
+        
+        # 左侧：应用包含的动态库
+        left_panel = QGroupBox("应用包含的动态库")
+        left_layout = QVBoxLayout(left_panel)
+        
+        self.dylibs_list = QListWidget()
+        self.dylibs_list.setMinimumHeight(200)
+        self.dylibs_list.setMaximumHeight(250)
+        self.dylibs_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.dylibs_list.setToolTipDuration(10000)
+        self.dylibs_list.itemSelectionChanged.connect(self._on_dylib_selection_changed)
+        left_layout.addWidget(self.dylibs_list)
+        
+        # 应用动态库操作按钮
+        left_btn_layout = QHBoxLayout()
+        self.export_dylib_button = QPushButton("导出选中")
+        self.export_dylib_button.setEnabled(False)
+        self.export_dylib_button.clicked.connect(self._export_selected_dylib)
+        left_btn_layout.addWidget(self.export_dylib_button)
+        left_btn_layout.addStretch()
+        left_layout.addLayout(left_btn_layout)
+        
+        # 动态库统计信息
+        self.dylib_stats_label = QLabel("")
+        left_layout.addWidget(self.dylib_stats_label)
+        
+        # 右侧：待注入的动态库
+        right_panel = QGroupBox("待注入的动态库")
+        right_layout = QVBoxLayout(right_panel)
+        
+        self.inject_dylibs_list = QListWidget()
+        self.inject_dylibs_list.setMinimumHeight(200)
+        self.inject_dylibs_list.setMaximumHeight(250)
+        self.inject_dylibs_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.inject_dylibs_list.itemSelectionChanged.connect(self._on_inject_selection_changed)
+        right_layout.addWidget(self.inject_dylibs_list)
+        
+        # 待注入动态库操作按钮
+        right_btn_layout = QHBoxLayout()
+        self.add_dylib_button = QPushButton("添加dylib")
+        self.add_dylib_button.clicked.connect(self._add_inject_dylib)
+        self.add_framework_button = QPushButton("添加Framework")
+        self.add_framework_button.clicked.connect(self._add_inject_framework)
+        self.remove_inject_button = QPushButton("移除选中")
+        self.remove_inject_button.setEnabled(False)
+        self.remove_inject_button.clicked.connect(self._remove_selected_inject_dylib)
+        self.clear_inject_button = QPushButton("清空列表")
+        self.clear_inject_button.setEnabled(False)
+        self.clear_inject_button.clicked.connect(self._clear_inject_dylibs)
+        
+        # 第一行按钮
+        right_btn_row1 = QHBoxLayout()
+        right_btn_row1.addWidget(self.add_dylib_button)
+        right_btn_row1.addWidget(self.add_framework_button)
+        
+        # 第二行按钮
+        right_btn_row2 = QHBoxLayout()
+        right_btn_row2.addWidget(self.remove_inject_button)
+        right_btn_row2.addWidget(self.clear_inject_button)
+        
+        right_btn_layout = QVBoxLayout()
+        right_btn_layout.addLayout(right_btn_row1)
+        right_btn_layout.addLayout(right_btn_row2)
+        right_layout.addLayout(right_btn_layout)
+        
+        # 添加到水平分割布局
+        dylib_split_layout.addWidget(left_panel)
+        dylib_split_layout.addWidget(right_panel)
+        
+        dylibs_layout.addLayout(dylib_split_layout)
+        main_layout.addWidget(dylibs_group)
+        
+        # 进度条
+        progress_group = QGroupBox("签名进度")
+        progress_layout = QVBoxLayout(progress_group)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        
+        self.progress_label = QLabel("就绪")
+        
+        progress_layout.addWidget(self.progress_bar)
+        progress_layout.addWidget(self.progress_label)
+        
+        main_layout.addWidget(progress_group)
+        
+        # 按钮
+        button_layout = QHBoxLayout()
+        
+        self.sign_button = QPushButton("开始签名")
+        self.sign_button.clicked.connect(self.sign_ipa)
+        
+        self.cancel_button = QPushButton("取消")
+        self.cancel_button.clicked.connect(self._cancel_sign)
+        self.cancel_button.setEnabled(False)
+        
+        button_layout.addStretch()
+        button_layout.addWidget(self.sign_button)
+        button_layout.addWidget(self.cancel_button)
+        
+        main_layout.addLayout(button_layout)
+        
+        # 添加弹性空间
+        main_layout.addStretch()
+    
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        """
+        拖拽进入事件
+        
+        Args:
+            event: 拖拽事件
+        """
+        if event.mimeData().hasUrls():
+            url = event.mimeData().urls()[0]
+            if url.isLocalFile():
+                file_path = url.toLocalFile()
+                if file_path.lower().endswith('.ipa'):
+                    event.acceptProposedAction()
+    
+    def dropEvent(self, event: QDropEvent):
+        """
+        放置事件
+        
+        Args:
+            event: 放置事件
+        """
+        if event.mimeData().hasUrls():
+            url = event.mimeData().urls()[0]
+            if url.isLocalFile():
+                file_path = url.toLocalFile()
+                if file_path.lower().endswith('.ipa'):
+                    self.set_ipa_path(file_path)
+                    event.acceptProposedAction()
+    
+    def _update_certificate_list(self):
+        """更新证书列表"""
+        self.cert_combo.clear()
+        
+        certificates = self.certificate_manager.get_all_certificates()
+        if not certificates:
+            self.cert_combo.addItem("未找到证书")
+            self.cert_combo.setEnabled(False)
+            return
+        
+        self.cert_combo.setEnabled(True)
+        for cert in certificates:
+            cert_name = cert.get("name", "未命名证书")
+            cert_id = cert.get("id")
+            p12_path = cert.get("p12_path", "")
+            mobileprovision_path = cert.get("mobileprovision_path", "")
+            
+            # 检查证书文件是否存在
+            if not os.path.exists(p12_path):
+                cert_name += " [证书文件不存在]"
+            
+            # 检查描述文件是否存在
+            if mobileprovision_path and not os.path.exists(mobileprovision_path):
+                cert_name += " [描述文件不存在]"
+                
+            self.cert_combo.addItem(cert_name, cert_id)
+    
+    def _browse_ipa(self):
+        """浏览IPA文件"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择IPA文件", "", "IPA文件 (*.ipa);;所有文件 (*.*)"
+        )
+        
+        if file_path:
+            self.set_ipa_path(file_path)
+    
+    def set_ipa_path(self, file_path):
+        """
+        设置IPA文件路径
+        
+        Args:
+            file_path: IPA文件路径
+        """
+        self.ipa_path = file_path
+        self.ipa_path_edit.setText(file_path)
+        
+        # 重置进度条
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("就绪")
+        
+        # 清空动态库列表
+        self.dylibs_list.clear()
+        
+        # 解析IPA文件
+        self._parse_ipa()
+    
+    def _parse_ipa(self):
+        """解析IPA文件"""
+        if not self.ipa_path or not os.path.exists(self.ipa_path):
+            return
+        
+        # 禁用UI
+        self._set_ui_enabled(False)
+        self.progress_label.setText("正在解析IPA文件...")
+        
+        # 创建并启动解析线程
+        self.parse_thread = ParseIpaThread(self.ipa_path)
+        self.parse_thread.finished.connect(self._on_parse_finished)
+        self.parse_thread.error.connect(self._on_parse_error)
+        self.parse_thread.progress.connect(self._on_parse_progress)
+        self.parse_thread.start()
+    
+    @pyqtSlot(dict)
+    def _on_parse_finished(self, app_info):
+        """
+        解析完成回调
+        
+        Args:
+            app_info: 应用信息
+        """
+        self.app_info = app_info
+        self.extract_dir = app_info.get("extract_dir")
+        self.app_path = app_info.get("app_path")
+        
+        # 填充UI
+        bundle_id = app_info.get("bundle_id", "")
+        bundle_name = app_info.get("bundle_name", "")
+        display_name = app_info.get("display_name", "")
+        version = app_info.get("version", "")
+        build = app_info.get("build", "")
+        
+        self.bundle_id_edit.setText(bundle_id)
+        
+        # 尝试区分中英文应用名称
+        if display_name and bundle_name and display_name != bundle_name:
+            # 如果显示名称和包名不同，通常显示名称是本地化的（可能是中文）
+            self.app_name_cn_edit.setText(display_name)
+            self.app_name_en_edit.setText(bundle_name)
+        else:
+            # 如果只有一个名称，则都显示相同的
+            name_to_show = display_name or bundle_name or ""
+            self.app_name_cn_edit.setText(name_to_show)
+            self.app_name_en_edit.setText(name_to_show)
+        
+        self.version_code_edit.setText(build)
+        self.version_name_edit.setText(version)
+        
+        # 显示动态库列表
+        self._display_dylibs(app_info.get("dylibs", []))
+        
+        # 启用UI
+        self._set_ui_enabled(True)
+        self.progress_label.setText("IPA文件解析成功")
+    
+    @pyqtSlot(str)
+    def _on_parse_error(self, error_msg):
+        """
+        解析错误回调
+        
+        Args:
+            error_msg: 错误信息
+        """
+        # 启用UI
+        self._set_ui_enabled(True)
+        self.progress_label.setText(error_msg)
+        logger.error(error_msg)
+    
+    @pyqtSlot(str)
+    def _on_parse_progress(self, message):
+        """
+        解析进度回调
+        
+        Args:
+            message: 进度消息
+        """
+        self.progress_label.setText(message)
+    
+    def _set_ui_enabled(self, enabled):
+        """
+        设置UI组件启用状态
+        
+        Args:
+            enabled: 是否启用
+        """
+        self.sign_button.setEnabled(enabled)
+        self.cert_combo.setEnabled(enabled)
+        self.bundle_id_edit.setEnabled(enabled)
+        self.app_name_cn_edit.setEnabled(enabled)
+        self.app_name_en_edit.setEnabled(enabled)
+        self.version_code_edit.setEnabled(enabled)
+        self.version_name_edit.setEnabled(enabled)
+    
+    def _display_dylibs(self, dylibs):
+        """
+        显示动态库列表
+        
+        Args:
+            dylibs: 动态库列表
+        """
+        self.dylibs_list.clear()
+        
+        if not dylibs:
+            self.dylibs_list.addItem("未找到动态库")
+            self.dylib_stats_label.setText("总计: 0 个动态库")
+            return
+        
+        # 分类动态库
+        system_dylibs = []
+        framework_dylibs = []
+        custom_dylibs = []
+        
+        for dylib in dylibs:
+            dylib_name = dylib.get("name", "")
+            dylib_path = dylib.get("path", "")
+            dylib_type = dylib.get("type", "")
+            dylib_location = dylib.get("location", "")
+            dylib_size = dylib.get("size", "")
+            
+            # 分类
+            if dylib_path.startswith("/System/") or dylib_path.startswith("/usr/lib/"):
+                system_dylibs.append(dylib)
+            elif dylib_name.endswith(".framework"):
+                framework_dylibs.append(dylib)
+            else:
+                custom_dylibs.append(dylib)
+        
+        # 添加系统动态库
+        if system_dylibs:
+            system_header = QListWidgetItem("系统动态库:")
+            system_header.setFlags(Qt.ItemIsEnabled)
+            system_header.setBackground(Qt.lightGray)
+            self.dylibs_list.addItem(system_header)
+            
+            for dylib in system_dylibs:
+                self._add_dylib_item(dylib)
+        
+        # 添加框架动态库
+        if framework_dylibs:
+            framework_header = QListWidgetItem("框架动态库:")
+            framework_header.setFlags(Qt.ItemIsEnabled)
+            framework_header.setBackground(Qt.lightGray)
+            self.dylibs_list.addItem(framework_header)
+            
+            for dylib in framework_dylibs:
+                self._add_dylib_item(dylib)
+        
+        # 添加自定义动态库
+        if custom_dylibs:
+            custom_header = QListWidgetItem("自定义动态库:")
+            custom_header.setFlags(Qt.ItemIsEnabled)
+            custom_header.setBackground(Qt.lightGray)
+            self.dylibs_list.addItem(custom_header)
+            
+            for dylib in custom_dylibs:
+                self._add_dylib_item(dylib)
+        
+        # 更新统计信息
+        total_count = len(dylibs)
+        system_count = len(system_dylibs)
+        framework_count = len(framework_dylibs)
+        custom_count = len(custom_dylibs)
+        
+        stats_text = f"总计: {total_count} 个动态库 (系统: {system_count}, 框架: {framework_count}, 自定义: {custom_count})"
+        self.dylib_stats_label.setText(stats_text)
+    
+    def _add_dylib_item(self, dylib):
+        """
+        添加动态库项
+        
+        Args:
+            dylib: 动态库信息
+        """
+        dylib_name = dylib.get("name", "")
+        dylib_path = dylib.get("path", "")
+        dylib_type = dylib.get("type", "")
+        dylib_location = dylib.get("location", "")
+        dylib_size = dylib.get("size", "")
+        
+        # 构建显示文本
+        display_text = dylib_name
+        
+        # 添加大小信息（如果有）
+        if dylib_size:
+            display_text = f"{dylib_name} ({dylib_size})"
+        
+        # 构建完整工具提示
+        tooltip_parts = [
+            f"名称: {dylib_name}",
+            f"路径: {dylib_path}",
+        ]
+        
+        if dylib_type:
+            tooltip_parts.append(f"类型: {dylib_type}")
+            
+        if dylib_location:
+            tooltip_parts.append(f"位置: {dylib_location}")
+            
+        if dylib_size:
+            tooltip_parts.append(f"大小: {dylib_size}")
+            
+        tooltip = "\n".join(tooltip_parts)
+        
+        item = QListWidgetItem(display_text)
+        item.setToolTip(tooltip)
+        
+        # 根据动态库类型设置不同的颜色
+        if dylib_type == "自定义":
+            item.setForeground(Qt.darkBlue)
+        elif dylib_type == "框架":
+            item.setForeground(Qt.darkGreen)
+        else:  # 系统
+            item.setForeground(Qt.darkGray)
+        
+        self.dylibs_list.addItem(item)
+    
+    def sign_ipa(self):
+        """签名IPA文件"""
+        # 检查IPA路径
+        if not self.ipa_path or not os.path.exists(self.ipa_path):
+            QMessageBox.warning(self, "错误", "请先选择有效的IPA文件")
+            return
+        
+        # 检查证书
+        if self.cert_combo.count() == 0 or not self.cert_combo.isEnabled():
+            QMessageBox.warning(self, "错误", "未找到有效的证书，请先添加证书")
+            return
+        
+        # 获取证书ID
+        cert_id = self.cert_combo.currentData()
+        if not cert_id:
+            QMessageBox.warning(self, "错误", "请选择有效的证书")
+            return
+        
+        # 验证证书文件是否存在
+        certificate = self.certificate_manager.get_certificate(cert_id)
+        if not certificate:
+            QMessageBox.warning(self, "错误", "无法获取证书信息")
+            return
+        
+        p12_path = certificate.get("p12_path", "")
+        mobileprovision_path = certificate.get("mobileprovision_path", "")
+        
+        if not os.path.exists(p12_path):
+            QMessageBox.warning(self, "错误", f"证书文件不存在: {p12_path}")
+            return
+        
+        if mobileprovision_path and not os.path.exists(mobileprovision_path):
+            QMessageBox.warning(self, "错误", f"描述文件不存在: {mobileprovision_path}")
+            return
+        
+        # 获取签名选项
+        bundle_id = self.bundle_id_edit.text().strip()
+        display_name = self.app_name_cn_edit.text().strip()
+        bundle_name = self.app_name_en_edit.text().strip()
+        version_code = self.version_code_edit.text().strip()
+        version_name = self.version_name_edit.text().strip()
+        
+        # 获取动态库列表
+        inject_dylibs = None
+        if self.inject_dylibs:
+            # 检查每个动态库文件是否存在
+            valid_dylibs = []
+            for dylib_path in self.inject_dylibs:
+                if os.path.exists(dylib_path):
+                    valid_dylibs.append(dylib_path)
+                else:
+                    logger.warning(f"动态库文件不存在: {dylib_path}")
+            
+            if valid_dylibs:
+                inject_dylibs = valid_dylibs
+                logger.info(f"将注入 {len(valid_dylibs)} 个动态库")
+        
+        # 使用固定的输出目录（apps目录）
+        current_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        output_dir = os.path.join(current_dir, "apps")
+        
+        # 确保输出目录存在
+        if not os.path.exists(output_dir):
+            try:
+                os.makedirs(output_dir)
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"创建输出目录失败: {str(e)}")
+                return
+        
+        # 生成输出文件路径
+        filename = os.path.basename(self.ipa_path)
+        name, ext = os.path.splitext(filename)
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        output_path = os.path.join(output_dir, f"{name}_signed_{timestamp}{ext}")
+        
+        # 传递original_app_name
+        original_app_name = self.app_info.get("original_app_name") if self.app_info else None
+        
+        # 更新UI状态
+        self._set_ui_enabled(False)
+        self.cancel_button.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("准备签名...")
+        
+        # 创建并启动签名线程
+        self.sign_thread = SignIpaThread(
+            self.sign_engine,
+            self.ipa_path,
+            cert_id,
+            output_path,
+            bundle_id,
+            bundle_name,
+            version_name,
+            inject_dylibs,
+            original_app_name,
+            display_name,
+            version_code,
+            version_name,
+            self.inject_frameworks,  # 添加框架信息
+            self.extract_dir,  # 传递已解压的路径
+            self.app_path      # 传递应用路径
+        )
+        self.sign_thread.finished.connect(self._on_sign_finished)
+        self.sign_thread.error.connect(self._on_sign_error)
+        self.sign_thread.progress.connect(self._on_sign_progress)
+        self.sign_thread.start()
+    
+    @pyqtSlot(str)
+    def _on_sign_finished(self, output_path):
+        """
+        签名完成回调
+        
+        Args:
+            output_path: 输出文件路径
+        """
+        # 恢复UI状态
+        self._set_ui_enabled(True)
+        self.cancel_button.setEnabled(False)
+        self.progress_bar.setValue(100)
+        self.progress_label.setText("签名完成")
+        
+        # 创建自定义成功消息对话框
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("签名成功")
+        msg_box.setText(f"IPA文件签名成功！\n\n输出文件: {output_path}")
+        msg_box.setIcon(QMessageBox.Information)
+        
+        # 创建自定义按钮
+        ok_button = msg_box.addButton("确定", QMessageBox.AcceptRole)
+        open_button = msg_box.addButton("打开", QMessageBox.ActionRole)
+        
+        msg_box.exec_()
+        
+        # 如果用户点击"打开"，则打开文件所在目录
+        if msg_box.clickedButton() == open_button:
+            import subprocess
+            import platform
+            
+            if platform.system() == "Windows":
+                subprocess.Popen(f'explorer /select,"{output_path}"')
+            elif platform.system() == "Darwin":  # macOS
+                subprocess.Popen(["open", "-R", output_path])
+            else:  # Linux
+                subprocess.Popen(["xdg-open", os.path.dirname(output_path)])
+    
+    @pyqtSlot(str)
+    def _on_sign_error(self, error_msg):
+        """
+        签名错误回调
+        
+        Args:
+            error_msg: 错误信息
+        """
+        # 恢复UI状态
+        self._set_ui_enabled(True)
+        self.cancel_button.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("签名失败")
+        
+        QMessageBox.critical(self, "签名失败", error_msg)
+    
+    @pyqtSlot(int, str)
+    def _on_sign_progress(self, progress, message):
+        """
+        签名进度回调
+        
+        Args:
+            progress: 进度值
+            message: 进度消息
+        """
+        self.progress_bar.setValue(progress)
+        self.progress_label.setText(message)
+    
+    def _cancel_sign(self):
+        """取消签名"""
+        if self.sign_thread and self.sign_thread.isRunning():
+            self.sign_engine.cancel()
+            self.cancel_button.setEnabled(False)
+            self.progress_label.setText("正在取消...")
+    
+    def _export_selected_dylib(self):
+        """导出选中动态库"""
+        selected_items = self.dylibs_list.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "错误", "请先选择要导出的动态库")
+            return
+        
+        if not self.app_path:
+            QMessageBox.warning(self, "错误", "未找到应用路径")
+            return
+        
+        # 获取选中的动态库
+        selected_dylib = None
+        for item in selected_items:
+            # 跳过分类标题
+            if item.flags() & Qt.ItemIsSelectable:
+                selected_dylib = item
+                break
+        
+        if not selected_dylib:
+            QMessageBox.warning(self, "错误", "请选择有效的动态库")
+            return
+        
+        # 从toolTip中提取名称和路径
+        dylib_tooltip = selected_dylib.toolTip()
+        dylib_name = ""
+        dylib_path = ""
+        for line in dylib_tooltip.split('\n'):
+            if line.startswith("名称: "):
+                dylib_name = line.replace("名称: ", "")
+            elif line.startswith("路径: "):
+                dylib_path = line.replace("路径: ", "")
+        if not dylib_name:
+            display_text = selected_dylib.text()
+            if " (" in display_text:
+                dylib_name = display_text.split(" (")[0]
+        
+        # 优先用toolTip里的路径
+        export_source_path = dylib_path if dylib_path and os.path.exists(dylib_path) else None
+        
+        # 如果路径不存在，再尝试Frameworks目录
+        if not export_source_path:
+            frameworks_dir = os.path.join(self.app_path, "Frameworks")
+            candidate = os.path.join(frameworks_dir, dylib_name)
+            if os.path.exists(candidate):
+                export_source_path = candidate
+        # 再尝试.app根目录
+        if not export_source_path:
+            candidate = os.path.join(self.app_path, dylib_name)
+            if os.path.exists(candidate):
+                export_source_path = candidate
+        
+        if export_source_path and os.path.exists(export_source_path):
+            if os.path.isfile(export_source_path):
+                file_path, _ = QFileDialog.getSaveFileName(
+                    self, "导出动态库", dylib_name, "动态库文件 (*.dylib);;所有文件 (*.*)"
+                )
+                if not file_path:
+                    return
+                try:
+                    shutil.copy2(export_source_path, file_path)
+                    QMessageBox.information(self, "导出成功", f"动态库 {dylib_name} 导出成功！")
+                except Exception as e:
+                    QMessageBox.critical(self, "导出失败", f"导出动态库失败: {str(e)}")
+            elif os.path.isdir(export_source_path):
+                # 是framework目录，建议导出为zip
+                file_path, _ = QFileDialog.getSaveFileName(
+                    self, "导出Framework", dylib_name + ".zip", "ZIP文件 (*.zip);;所有文件 (*.*)"
+                )
+                if not file_path:
+                    return
+                try:
+                    with zipfile.ZipFile(file_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                        for root, dirs, files in os.walk(export_source_path):
+                            for file in files:
+                                abs_path = os.path.join(root, file)
+                                rel_path = os.path.relpath(abs_path, os.path.dirname(export_source_path))
+                                zipf.write(abs_path, rel_path)
+                    QMessageBox.information(self, "导出成功", f"Framework {dylib_name} 已打包为ZIP导出！")
+                except Exception as e:
+                    QMessageBox.critical(self, "导出失败", f"导出Framework失败: {str(e)}")
+            else:
+                QMessageBox.warning(self, "错误", f"未知的导出类型: {export_source_path}")
+        else:
+            QMessageBox.warning(self, "错误", f"找不到动态库文件: {dylib_path if dylib_path else dylib_name}")
+    
+    def _add_inject_framework(self):
+        """添加.framework目录动态库"""
+        framework_dir = QFileDialog.getExistingDirectory(
+            self, 
+            "选择.framework目录",
+            os.path.expanduser("~"),
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+        )
+        
+        if framework_dir:
+            # 检查是否为.framework目录
+            if not framework_dir.endswith('.framework'):
+                QMessageBox.warning(self, "警告", "请选择.framework目录！")
+                return
+            
+            # 获取framework名称
+            framework_name = os.path.basename(framework_dir)
+            framework_binary_name = framework_name.replace('.framework', '')
+            
+            # 查找framework内的主二进制文件
+            binary_path = os.path.join(framework_dir, framework_binary_name)
+            if not os.path.exists(binary_path):
+                QMessageBox.warning(self, "警告", f"未找到框架二进制文件: {framework_binary_name}")
+                return
+            
+            # 检查是否已经添加过（检查framework目录路径）
+            for framework_info in self.inject_frameworks:
+                if framework_info["framework_dir"] == framework_dir:
+                    QMessageBox.information(self, "提示", "该Framework已在注入列表中")
+                    return
+            
+            # 添加到框架注入列表
+            framework_info = {
+                "framework_dir": framework_dir,
+                "framework_name": framework_name,
+                "binary_path": binary_path
+            }
+            self.inject_frameworks.append(framework_info)
+            
+            # 添加到UI列表
+            item = QListWidgetItem(f"{framework_name} (Framework)")
+            item.setToolTip(f"Framework目录: {framework_dir}\n主二进制: {binary_path}")
+            item.setData(Qt.UserRole, "framework")  # 标记为framework
+            self.inject_dylibs_list.addItem(item)
+            self.clear_inject_button.setEnabled(True)
+            
+            QMessageBox.information(self, "成功", f"已添加Framework: {framework_name}")
+
+    def _add_inject_dylib(self):
+        """添加待注入动态库"""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择动态库", "", "动态库文件 (*.dylib);;所有文件 (*.*)"
+        )
+        
+        if not file_paths:
+            return
+        
+        for file_path in file_paths:
+            # 检查文件是否存在
+            if not os.path.exists(file_path):
+                QMessageBox.warning(self, "错误", f"文件不存在: {file_path}")
+                continue
+            
+            # 检查是否已添加
+            already_added = False
+            for i in range(self.inject_dylibs_list.count()):
+                item = self.inject_dylibs_list.item(i)
+                if item.toolTip() == file_path:
+                    already_added = True
+                    break
+            
+            if already_added:
+                QMessageBox.warning(self, "警告", f"动态库已添加: {file_path}")
+                continue
+            
+            # 添加到列表
+            dylib_name = os.path.basename(file_path)
+            item = QListWidgetItem(dylib_name)
+            item.setToolTip(file_path)
+            item.setData(Qt.UserRole, "dylib")  # 标记为dylib
+            self.inject_dylibs_list.addItem(item)
+            
+            # 添加到待注入列表
+            self.inject_dylibs.append(file_path)
+        
+        # 更新按钮状态
+        self.clear_inject_button.setEnabled(self.inject_dylibs_list.count() > 0)
+        # 动态调整高度
+        self._update_inject_list_height()
+    
+    def _remove_selected_inject_dylib(self):
+        """移除选中待注入动态库"""
+        selected_items = self.inject_dylibs_list.selectedItems()
+        if not selected_items:
+            return
+        
+        for item in selected_items:
+            row = self.inject_dylibs_list.row(item)
+            item_type = item.data(Qt.UserRole)
+            
+            if item_type == "framework":
+                # 处理Framework移除
+                tooltip = item.toolTip()
+                framework_dir = None
+                for line in tooltip.split('\n'):
+                    if line.startswith("Framework目录:"):
+                        framework_dir = line.replace("Framework目录: ", "").strip()
+                        break
+                
+                # 从框架列表中移除
+                if framework_dir:
+                    self.inject_frameworks = [f for f in self.inject_frameworks if f["framework_dir"] != framework_dir]
+            else:
+                # 处理dylib移除
+                dylib_path = item.toolTip()
+                if dylib_path and dylib_path in self.inject_dylibs:
+                    self.inject_dylibs.remove(dylib_path)
+            
+            # 从UI列表中移除
+            self.inject_dylibs_list.takeItem(row)
+        
+        # 更新按钮状态
+        self.clear_inject_button.setEnabled(self.inject_dylibs_list.count() > 0)
+        self.remove_inject_button.setEnabled(False)
+        # 动态调整高度
+        self._update_inject_list_height()
+    
+    def _clear_inject_dylibs(self):
+        """清空待注入动态库列表"""
+        self.inject_dylibs_list.clear()
+        self.inject_dylibs = []
+        self.inject_frameworks = []
+        
+        # 更新按钮状态
+        self.clear_inject_button.setEnabled(False)
+        self.remove_inject_button.setEnabled(False)
+        # 动态调整高度
+        self._update_inject_list_height()
+
+    def _update_inject_list_height(self):
+        """根据内容动态调整待注入动态库列表高度"""
+        count = self.inject_dylibs_list.count()
+        if count == 0:
+            self.inject_dylibs_list.setFixedHeight(30)
+        else:
+            # 每行高度约24，最多显示5行
+            self.inject_dylibs_list.setFixedHeight(min(120, 24 * count + 6))
+
+    def _on_dylib_selection_changed(self):
+        """动态库选择变化事件"""
+        selected_items = self.dylibs_list.selectedItems()
+        self.export_dylib_button.setEnabled(bool(selected_items))
+    
+    def _on_inject_selection_changed(self):
+        """待注入动态库选择变化事件"""
+        selected_items = self.inject_dylibs_list.selectedItems()
+        self.remove_inject_button.setEnabled(bool(selected_items))
+        self.clear_inject_button.setEnabled(self.inject_dylibs_list.count() > 0) 

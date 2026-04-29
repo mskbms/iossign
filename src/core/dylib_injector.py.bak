@@ -1,0 +1,333 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os
+import shutil
+import tempfile
+import logging
+import zipfile
+from pathlib import Path
+import lief
+
+
+class DylibInjector:
+    """动态库注入模块，负责向IPA文件注入动态库"""
+    
+    def __init__(self, config):
+        """初始化动态库注入器
+        
+        Args:
+            config (dict): 应用配置字典
+        """
+        self.logger = logging.getLogger("DylibInjector")
+        self.config = config
+        self.temp_dir = config["general"]["temp_dir"]
+        
+        # 确保临时目录存在
+        os.makedirs(self.temp_dir, exist_ok=True)
+    
+    def inject_dylib(self, ipa_path, dylib_paths, options=None):
+        """向IPA文件注入动态库
+        
+        Args:
+            ipa_path (str): IPA文件路径
+            dylib_paths (list): 动态库(.dylib)文件路径列表
+            options (dict, optional): 注入选项，包括:
+                - output_path: 输出IPA路径
+                - weak: 是否弱链接
+                - load_path: 动态库加载路径
+        
+        Returns:
+            tuple: (bool, str) - (是否成功, 输出路径或错误消息)
+        """
+        if options is None:
+            options = {}
+        
+        if not isinstance(dylib_paths, list):
+            dylib_paths = [dylib_paths]
+        
+        try:
+            # 1. 创建临时工作目录
+            work_dir = tempfile.mkdtemp(dir=self.temp_dir)
+            self.logger.info(f"创建临时工作目录: {work_dir}")
+            
+            # 2. 解压IPA文件
+            extracted_path = os.path.join(work_dir, "extracted")
+            os.makedirs(extracted_path, exist_ok=True)
+            self._unzip_ipa(ipa_path, extracted_path)
+            
+            # 3. 找到Payload目录和.app目录
+            payload_dir = os.path.join(extracted_path, "Payload")
+            if not os.path.exists(payload_dir):
+                return False, "IPA文件结构错误: 找不到Payload目录"
+            
+            app_dir = None
+            for item in os.listdir(payload_dir):
+                if item.endswith(".app"):
+                    app_dir = os.path.join(payload_dir, item)
+                    break
+            
+            if not app_dir:
+                return False, "IPA文件结构错误: 找不到.app目录"
+            
+            # 4. 找到可执行文件
+            executable = self._find_executable(app_dir)
+            if not executable:
+                return False, "无法找到应用可执行文件"
+            
+            # 5. 创建Frameworks目录(如果不存在)
+            frameworks_dir = os.path.join(app_dir, "Frameworks")
+            if not os.path.exists(frameworks_dir):
+                os.makedirs(frameworks_dir)
+            
+            # 6. 复制动态库到Frameworks目录
+            for dylib_path in dylib_paths:
+                dylib_name = os.path.basename(dylib_path)
+                
+                # 处理不同类型的库文件
+                is_framework = dylib_path.endswith('.framework')
+                
+                if is_framework:
+                    # 复制整个framework目录
+                    framework_name = os.path.basename(dylib_path)
+                    target_framework_dir = os.path.join(frameworks_dir, framework_name)
+                    
+                    if os.path.exists(target_framework_dir):
+                        shutil.rmtree(target_framework_dir)
+                    
+                    # 复制整个framework目录及其内容
+                    shutil.copytree(dylib_path, target_framework_dir)
+                    
+                    # 获取framework内部的实际dylib文件名
+                    framework_base_name = os.path.splitext(framework_name)[0]
+                    framework_dylib = os.path.join(target_framework_dir, framework_base_name)
+                    
+                    # 设置权限
+                    for root, _, files in os.walk(target_framework_dir):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            os.chmod(file_path, 0o755)
+                    
+                    # 注入framework
+                    success, message = self._inject_framework(executable, framework_name, options)
+                    if not success:
+                        return False, message
+                else:
+                    # 处理普通的.dylib文件
+                    target_path = os.path.join(frameworks_dir, dylib_name)
+                    shutil.copy2(dylib_path, target_path)
+                    
+                    # 设置动态库权限
+                    os.chmod(target_path, 0o755)
+                    
+                    # 注入动态库
+                    success, message = self._inject_single_dylib(executable, dylib_name, options)
+                    if not success:
+                        return False, message
+            
+            # 7. 重新打包IPA
+            output_name = options.get("output_path", "")
+            if not output_name:
+                output_dir = self.config["general"]["output_dir"]
+                os.makedirs(output_dir, exist_ok=True)
+                ipa_name = os.path.basename(ipa_path)
+                output_name = os.path.join(output_dir, f"{os.path.splitext(ipa_name)[0]}_injected.ipa")
+            
+            self._repack_ipa(extracted_path, output_name)
+            
+            # 8. 清理临时文件
+            shutil.rmtree(work_dir, ignore_errors=True)
+            
+            return True, output_name
+            
+        except Exception as e:
+            self.logger.error(f"注入动态库过程出错: {str(e)}")
+            return False, f"注入失败: {str(e)}"
+    
+    def _unzip_ipa(self, ipa_path, extract_to):
+        """解压IPA文件
+        
+        Args:
+            ipa_path (str): IPA文件路径
+            extract_to (str): 解压目标路径
+        """
+        self.logger.info(f"解压IPA文件: {ipa_path} 到 {extract_to}")
+        with zipfile.ZipFile(ipa_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_to)
+    
+    def _find_executable(self, app_dir):
+        """在.app目录中找到主可执行文件
+        
+        Args:
+            app_dir (str): .app目录路径
+        
+        Returns:
+            str: 可执行文件路径，如果找不到则返回None
+        """
+        try:
+            # 读取Info.plist获取可执行文件名
+            import plistlib
+            info_plist_path = os.path.join(app_dir, "Info.plist")
+            
+            if os.path.exists(info_plist_path):
+                with open(info_plist_path, 'rb') as f:
+                    plist = plistlib.load(f)
+                
+                if 'CFBundleExecutable' in plist:
+                    executable_name = plist['CFBundleExecutable']
+                    executable_path = os.path.join(app_dir, executable_name)
+                    
+                    if os.path.exists(executable_path):
+                        return executable_path
+            
+            # 如果通过Info.plist找不到，尝试在.app目录下查找可执行文件
+            for item in os.listdir(app_dir):
+                item_path = os.path.join(app_dir, item)
+                if os.path.isfile(item_path) and os.access(item_path, os.X_OK):
+                    return item_path
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"查找可执行文件失败: {str(e)}")
+            return None
+    
+    def _inject_single_dylib(self, executable_path, dylib_name, options):
+        """向可执行文件注入单个动态库
+        
+        Args:
+            executable_path (str): 可执行文件路径
+            dylib_name (str): 动态库名称
+            options (dict): 注入选项
+        
+        Returns:
+            tuple: (bool, str) - (是否成功, 消息)
+        """
+        try:
+            # 构建动态库加载路径
+            load_path = options.get("load_path", "@executable_path/Frameworks/")
+            if not load_path.endswith("/"):
+                load_path += "/"
+            
+            dylib_load_path = f"{load_path}{dylib_name}"
+            
+            # 使用lief库注入动态库
+            self.logger.info(f"使用lief注入动态库: {dylib_load_path} 到 {executable_path}")
+            
+            # 解析Mach-O文件
+            binary = lief.parse(executable_path)
+            if binary is None:
+                self.logger.error("无法解析可执行文件")
+                return False, "无法解析可执行文件，可能不是有效的Mach-O格式"
+            
+            # 检查是否已存在相同动态库
+            existing_libraries = [lib.name for lib in binary.libraries]
+            if dylib_load_path in existing_libraries:
+                self.logger.info(f"动态库已存在: {dylib_load_path}")
+                return True, "动态库已存在，无需重复注入"
+            
+            # 添加动态库引用
+            if options.get("weak", False):
+                # 添加为弱引用
+                binary.add_library(dylib_load_path, weak=True)
+            else:
+                # 添加为强引用
+                binary.add_library(dylib_load_path)
+            
+            # 写回文件
+            binary.write(executable_path)
+            
+            self.logger.info(f"成功注入动态库: {dylib_name}")
+            return True, "注入成功"
+            
+        except Exception as e:
+            self.logger.error(f"注入动态库失败: {str(e)}")
+            return False, f"注入过程出错: {str(e)}"
+    
+    def _inject_framework(self, executable_path, framework_name, options):
+        """向可执行文件注入framework
+        
+        Args:
+            executable_path (str): 可执行文件路径
+            framework_name (str): Framework名称
+            options (dict): 注入选项
+        
+        Returns:
+            tuple: (bool, str) - (是否成功, 消息)
+        """
+        try:
+            # 获取framework内部的实际dylib文件名
+            framework_base_name = os.path.splitext(framework_name)[0]
+            
+            # 构建framework加载路径
+            load_path = options.get("load_path", "@executable_path/Frameworks/")
+            if not load_path.endswith("/"):
+                load_path += "/"
+            
+            # Framework实际的动态库加载路径
+            dylib_load_path = f"{load_path}{framework_name}/{framework_base_name}"
+            
+            self.logger.info(f"注入Framework: {dylib_load_path} 到 {executable_path}")
+            
+            # 解析Mach-O文件
+            binary = lief.parse(executable_path)
+            if binary is None:
+                self.logger.error("无法解析可执行文件")
+                return False, "无法解析可执行文件，可能不是有效的Mach-O格式"
+            
+            # 检查是否已存在相同framework
+            existing_libraries = [lib.name for lib in binary.libraries]
+            if dylib_load_path in existing_libraries:
+                self.logger.info(f"Framework已存在: {dylib_load_path}")
+                return True, "Framework已存在，无需重复注入"
+            
+            # 添加framework引用
+            if options.get("weak", False):
+                # 添加为弱引用
+                binary.add_library(dylib_load_path, weak=True)
+            else:
+                # 添加为强引用
+                binary.add_library(dylib_load_path)
+            
+            # 写回文件
+            binary.write(executable_path)
+            
+            self.logger.info(f"成功注入Framework: {framework_name}")
+            return True, "注入成功"
+            
+        except Exception as e:
+            self.logger.error(f"注入Framework失败: {str(e)}")
+            return False, f"注入过程出错: {str(e)}"
+    
+    def _repack_ipa(self, extracted_dir, output_path):
+        """重新打包IPA文件
+        
+        Args:
+            extracted_dir (str): 解压后的目录
+            output_path (str): 输出IPA路径
+        """
+        try:
+            self.logger.info(f"重新打包IPA: {output_path}")
+            
+            # 确保输出目录存在
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            
+            # 切换到解压目录
+            current_dir = os.getcwd()
+            os.chdir(extracted_dir)
+            
+            # 创建ZIP文件
+            with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for root, _, files in os.walk('.'):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        zipf.write(file_path)
+            
+            # 切回原目录
+            os.chdir(current_dir)
+            
+            self.logger.info(f"IPA打包完成: {output_path}")
+            
+        except Exception as e:
+            self.logger.error(f"重新打包IPA失败: {str(e)}")
+            raise 

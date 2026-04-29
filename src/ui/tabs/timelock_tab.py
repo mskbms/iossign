@@ -1,0 +1,409 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os
+import logging
+import datetime
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, 
+    QPushButton, QLabel, QLineEdit, QDateEdit, 
+    QSpinBox, QFileDialog, QGroupBox, QCheckBox,
+    QMessageBox, QTextEdit, QComboBox
+)
+from PyQt6.QtCore import Qt, pyqtSignal, QDate
+
+from core.timelock_manager import TimelockManager
+from core.dylib_manager import DylibManager
+
+
+class TimelockTab(QWidget):
+    """时间锁控制标签页"""
+    
+    status_message = pyqtSignal(str)
+    
+    def __init__(self, config):
+        """初始化时间锁控制标签页
+        
+        Args:
+            config (dict): 应用配置
+        """
+        super().__init__()
+        
+        self.logger = logging.getLogger("TimelockTab")
+        self.config = config
+        
+        # 创建时间锁管理器
+        self.timelock_manager = TimelockManager(config)
+        
+        # 创建动态库管理器
+        self.injector = DylibManager(config)
+        
+        # 初始化UI
+        self._init_ui()
+    
+    def _init_ui(self):
+        """初始化用户界面"""
+        # 主布局
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # ======== IPA文件选择 ========
+        ipa_group = QGroupBox("IPA文件")
+        ipa_layout = QHBoxLayout(ipa_group)
+        
+        self.ipa_path_edit = QLineEdit()
+        self.ipa_path_edit.setPlaceholderText("选择IPA文件...")
+        self.ipa_path_edit.setReadOnly(True)
+        
+        self.browse_ipa_btn = QPushButton("浏览...")
+        self.browse_ipa_btn.clicked.connect(self._browse_ipa)
+        
+        ipa_layout.addWidget(self.ipa_path_edit)
+        ipa_layout.addWidget(self.browse_ipa_btn)
+        
+        main_layout.addWidget(ipa_group)
+        
+        # ======== 时间锁动态库 ========
+        timelock_dylib_group = QGroupBox("时间锁动态库")
+        timelock_dylib_layout = QHBoxLayout(timelock_dylib_group)
+        
+        self.timelock_dylib_edit = QLineEdit()
+        self.timelock_dylib_edit.setPlaceholderText("选择时间锁动态库...")
+        self.timelock_dylib_edit.setReadOnly(True)
+        
+        self.browse_dylib_btn = QPushButton("浏览...")
+        self.browse_dylib_btn.clicked.connect(self._browse_dylib)
+        
+        timelock_dylib_layout.addWidget(self.timelock_dylib_edit)
+        timelock_dylib_layout.addWidget(self.browse_dylib_btn)
+        
+        main_layout.addWidget(timelock_dylib_group)
+        
+        # ======== 时间锁参数 ========
+        params_group = QGroupBox("时间锁参数")
+        params_layout = QFormLayout(params_group)
+        
+        # 过期日期
+        self.expiry_date_check = QCheckBox("启用过期日期")
+        self.expiry_date_check.setChecked(False)
+        self.expiry_date_check.stateChanged.connect(self._toggle_expiry_date)
+        
+        self.expiry_date_edit = QDateEdit()
+        self.expiry_date_edit.setCalendarPopup(True)
+        self.expiry_date_edit.setDate(QDate.currentDate().addMonths(1))
+        self.expiry_date_edit.setEnabled(False)
+        
+        # 试用期限
+        self.trial_period_check = QCheckBox("启用试用期限")
+        self.trial_period_check.setChecked(False)
+        self.trial_period_check.stateChanged.connect(self._toggle_trial_period)
+        
+        self.trial_period_spin = QSpinBox()
+        self.trial_period_spin.setRange(1, 365)
+        self.trial_period_spin.setValue(7)
+        self.trial_period_spin.setSuffix(" 天")
+        self.trial_period_spin.setEnabled(False)
+        
+        # 使用次数
+        self.usage_count_check = QCheckBox("启用使用次数限制")
+        self.usage_count_check.setChecked(False)
+        self.usage_count_check.stateChanged.connect(self._toggle_usage_count)
+        
+        self.usage_count_spin = QSpinBox()
+        self.usage_count_spin.setRange(1, 1000)
+        self.usage_count_spin.setValue(10)
+        self.usage_count_spin.setSuffix(" 次")
+        self.usage_count_spin.setEnabled(False)
+        
+        # 远程控制
+        self.remote_control_check = QCheckBox("启用远程控制")
+        self.remote_control_check.setChecked(False)
+        
+        # 设备ID限制
+        self.device_id_check = QCheckBox("启用设备ID限制")
+        self.device_id_check.setChecked(False)
+        self.device_id_check.stateChanged.connect(self._toggle_device_id)
+        
+        self.device_id_edit = QLineEdit()
+        self.device_id_edit.setPlaceholderText("输入设备ID...")
+        self.device_id_edit.setEnabled(False)
+        
+        # 添加到表单布局
+        params_layout.addRow(self.expiry_date_check)
+        params_layout.addRow("过期日期:", self.expiry_date_edit)
+        params_layout.addRow(self.trial_period_check)
+        params_layout.addRow("试用期限:", self.trial_period_spin)
+        params_layout.addRow(self.usage_count_check)
+        params_layout.addRow("使用次数:", self.usage_count_spin)
+        params_layout.addRow(self.remote_control_check)
+        params_layout.addRow(self.device_id_check)
+        params_layout.addRow("设备ID:", self.device_id_edit)
+        
+        main_layout.addWidget(params_group)
+        
+        # ======== 预设模板 ========
+        template_group = QGroupBox("预设模板")
+        template_layout = QHBoxLayout(template_group)
+        
+        self.template_combo = QComboBox()
+        self.template_combo.addItem("无")
+        self.template_combo.addItem("7天试用")
+        self.template_combo.addItem("30天试用")
+        self.template_combo.addItem("10次使用")
+        self.template_combo.addItem("一个月有效期")
+        self.template_combo.currentIndexChanged.connect(self._apply_template)
+        
+        self.apply_template_btn = QPushButton("应用模板")
+        self.apply_template_btn.clicked.connect(self._apply_selected_template)
+        
+        template_layout.addWidget(self.template_combo)
+        template_layout.addWidget(self.apply_template_btn)
+        
+        main_layout.addWidget(template_group)
+        
+        # ======== 操作按钮 ========
+        button_layout = QHBoxLayout()
+        
+        self.generate_btn = QPushButton("生成配置")
+        self.generate_btn.clicked.connect(self._generate_config)
+        
+        self.apply_btn = QPushButton("应用到IPA")
+        self.apply_btn.setMinimumHeight(40)
+        self.apply_btn.clicked.connect(self._apply_timelock)
+        
+        button_layout.addWidget(self.generate_btn)
+        button_layout.addWidget(self.apply_btn)
+        
+        main_layout.addLayout(button_layout)
+        
+        # ======== 配置预览 ========
+        preview_group = QGroupBox("配置预览")
+        preview_layout = QVBoxLayout(preview_group)
+        
+        self.preview_text = QTextEdit()
+        self.preview_text.setReadOnly(True)
+        self.preview_text.setMinimumHeight(150)
+        
+        preview_layout.addWidget(self.preview_text)
+        
+        main_layout.addWidget(preview_group)
+        
+        # 设置伸缩因子
+        main_layout.setStretch(6, 1)  # 让预览区域占据更多空间
+    
+    def _browse_ipa(self):
+        """浏览选择IPA文件"""
+        file_dialog = QFileDialog(self)
+        file_dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        file_dialog.setNameFilter("IPA文件 (*.ipa)")
+        
+        if file_dialog.exec():
+            selected_files = file_dialog.selectedFiles()
+            if selected_files:
+                self.ipa_path_edit.setText(selected_files[0])
+                self.status_message.emit(f"已选择IPA文件: {selected_files[0]}")
+    
+    def _browse_dylib(self):
+        """浏览选择时间锁动态库"""
+        file_dialog = QFileDialog(self)
+        file_dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        file_dialog.setNameFilter("动态库文件 (*.dylib)")
+        
+        if file_dialog.exec():
+            selected_files = file_dialog.selectedFiles()
+            if selected_files:
+                self.timelock_dylib_edit.setText(selected_files[0])
+                self.status_message.emit(f"已选择时间锁动态库: {selected_files[0]}")
+    
+    def _toggle_expiry_date(self, state):
+        """切换过期日期选项状态
+        
+        Args:
+            state: 复选框状态
+        """
+        self.expiry_date_edit.setEnabled(state == Qt.CheckState.Checked)
+    
+    def _toggle_trial_period(self, state):
+        """切换试用期限选项状态
+        
+        Args:
+            state: 复选框状态
+        """
+        self.trial_period_spin.setEnabled(state == Qt.CheckState.Checked)
+    
+    def _toggle_usage_count(self, state):
+        """切换使用次数选项状态
+        
+        Args:
+            state: 复选框状态
+        """
+        self.usage_count_spin.setEnabled(state == Qt.CheckState.Checked)
+    
+    def _toggle_device_id(self, state):
+        """切换设备ID选项状态
+        
+        Args:
+            state: 复选框状态
+        """
+        self.device_id_edit.setEnabled(state == Qt.CheckState.Checked)
+    
+    def _apply_template(self, index):
+        """应用预设模板
+        
+        Args:
+            index (int): 模板索引
+        """
+        if index == 0:  # 无
+            return
+        
+        if index == 1:  # 7天试用
+            self.trial_period_check.setChecked(True)
+            self.trial_period_spin.setValue(7)
+            self.expiry_date_check.setChecked(False)
+            self.usage_count_check.setChecked(False)
+            self.remote_control_check.setChecked(False)
+            self.device_id_check.setChecked(False)
+        
+        elif index == 2:  # 30天试用
+            self.trial_period_check.setChecked(True)
+            self.trial_period_spin.setValue(30)
+            self.expiry_date_check.setChecked(False)
+            self.usage_count_check.setChecked(False)
+            self.remote_control_check.setChecked(False)
+            self.device_id_check.setChecked(False)
+        
+        elif index == 3:  # 10次使用
+            self.trial_period_check.setChecked(False)
+            self.expiry_date_check.setChecked(False)
+            self.usage_count_check.setChecked(True)
+            self.usage_count_spin.setValue(10)
+            self.remote_control_check.setChecked(False)
+            self.device_id_check.setChecked(False)
+        
+        elif index == 4:  # 一个月有效期
+            self.trial_period_check.setChecked(False)
+            self.expiry_date_check.setChecked(True)
+            self.expiry_date_edit.setDate(QDate.currentDate().addMonths(1))
+            self.usage_count_check.setChecked(False)
+            self.remote_control_check.setChecked(False)
+            self.device_id_check.setChecked(False)
+    
+    def _apply_selected_template(self):
+        """应用当前选择的模板"""
+        index = self.template_combo.currentIndex()
+        if index > 0:
+            self._apply_template(index)
+            self._generate_config()
+    
+    def _generate_config(self):
+        """生成时间锁配置"""
+        # 构建配置选项
+        options = {}
+        
+        # 添加过期日期
+        if self.expiry_date_check.isChecked():
+            expiry_date = self.expiry_date_edit.date().toString("yyyy-MM-dd")
+            options["expiry_date"] = expiry_date
+        
+        # 添加试用期限
+        if self.trial_period_check.isChecked():
+            options["trial_period"] = self.trial_period_spin.value()
+        
+        # 添加使用次数
+        if self.usage_count_check.isChecked():
+            options["max_usage_count"] = self.usage_count_spin.value()
+        
+        # 添加远程控制
+        if self.remote_control_check.isChecked():
+            options["remote_control"] = True
+        
+        # 添加设备ID
+        if self.device_id_check.isChecked() and self.device_id_edit.text():
+            options["device_id"] = self.device_id_edit.text()
+        
+        # 生成配置
+        success, result = self.timelock_manager.generate_timelock_config(options)
+        
+        if success:
+            import json
+            # 显示配置预览
+            self.preview_text.setText(json.dumps(result, indent=4, ensure_ascii=False))
+            self.status_message.emit("时间锁配置已生成")
+        else:
+            self.preview_text.setText(f"配置生成失败: {result}")
+            self.status_message.emit(f"时间锁配置生成失败: {result}")
+            QMessageBox.critical(self, "配置生成失败", f"时间锁配置生成失败:\n{result}")
+    
+    def _apply_timelock(self):
+        """应用时间锁到IPA"""
+        # 检查输入
+        ipa_path = self.ipa_path_edit.text()
+        if not ipa_path:
+            QMessageBox.warning(self, "警告", "请选择IPA文件")
+            return
+        
+        dylib_path = self.timelock_dylib_edit.text()
+        if not dylib_path:
+            QMessageBox.warning(self, "警告", "请选择时间锁动态库")
+            return
+        
+        # 获取配置
+        config_text = self.preview_text.toPlainText()
+        if not config_text:
+            self._generate_config()
+            config_text = self.preview_text.toPlainText()
+            
+            if not config_text:
+                QMessageBox.warning(self, "警告", "请先生成时间锁配置")
+                return
+        
+        try:
+            import json
+            import tempfile
+            
+            # 解析配置
+            config = json.loads(config_text)
+            
+            # 保存配置到临时文件
+            with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as temp:
+                temp_path = temp.name
+                json.dump(config, temp, ensure_ascii=False)
+            
+            # 注入动态库
+            self.status_message.emit("正在注入时间锁动态库...")
+            success, result = self.injector.inject_dylib(
+                ipa_path,
+                [dylib_path],
+                {"output_path": ""}
+            )
+            
+            if not success:
+                os.unlink(temp_path)
+                self.status_message.emit(f"注入时间锁动态库失败: {result}")
+                QMessageBox.critical(self, "注入失败", f"注入时间锁动态库失败:\n{result}")
+                return
+            
+            # 保存配置到输出IPA
+            self.status_message.emit(f"时间锁应用成功，输出文件: {result}")
+            QMessageBox.information(
+                self,
+                "应用成功",
+                f"时间锁已成功应用到IPA!\n\n输出文件: {result}"
+            )
+            
+            # 清理临时文件
+            os.unlink(temp_path)
+            
+        except Exception as e:
+            self.status_message.emit(f"应用时间锁失败: {str(e)}")
+            QMessageBox.critical(self, "应用失败", f"应用时间锁失败:\n{str(e)}")
+    
+    def update_config(self, config):
+        """更新配置
+        
+        Args:
+            config (dict): 新的配置
+        """
+        self.config = config
+        self.timelock_manager = TimelockManager(config)
+        self.injector = DylibManager(config) 
